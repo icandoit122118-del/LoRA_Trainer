@@ -5,7 +5,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+import importlib.util
 import torch
+
+_BNB_OK: Optional[bool] = None
+
+
+def bnb_quant_available() -> bool:
+    """bitsandbytes 4bit/8bit GPU 양자화가 현재 환경에서 실제로 동작하는지 확인."""
+    global _BNB_OK
+    if _BNB_OK is not None:
+        return _BNB_OK
+    if not torch.cuda.is_available() or importlib.util.find_spec("bitsandbytes") is None:
+        _BNB_OK = False
+        return False
+    try:
+        import bitsandbytes as bnb
+
+        _BNB_OK = hasattr(bnb.nn, "Linear4bit") and getattr(bnb.nn, "Params4bit", None) is not None
+    except Exception:
+        _BNB_OK = False
+    return _BNB_OK
 
 
 @dataclass
@@ -68,11 +88,15 @@ def auto_memory_plan(arch: str, vram_gb: Optional[float] = None) -> MemoryPlan:
     """
     if vram_gb is None:
         vram_gb = gpu_info().total_gb
+    bnb_ok = bnb_quant_available()
     if arch == "krea2":
         if vram_gb >= 40:
             return MemoryPlan("none", "none", 0, "bf16 전체 로딩")
         if vram_gb >= 22:
             return MemoryPlan("fp8", "none", 0, "fp8 DiT (약 13GB)")
+        if not bnb_ok:
+            swap = 10 if vram_gb >= 14 else (16 if vram_gb >= 11 else 22)
+            return MemoryPlan("fp8", "none", swap, f"FP8 DiT + 블록 스왑 {swap} (bitsandbytes 미사용 환경)")
         if vram_gb >= 11:
             return MemoryPlan("nf4", "none", 0, "NF4 4bit DiT (약 7GB) + bf16 텍스트 인코더")
         return MemoryPlan("nf4", "nf4", 0, "NF4 4bit DiT + NF4 텍스트 인코더 (저VRAM)")
@@ -80,7 +104,10 @@ def auto_memory_plan(arch: str, vram_gb: Optional[float] = None) -> MemoryPlan:
     if vram_gb >= 22:
         return MemoryPlan("none", "none", 0, "bf16 전체 로딩")
     if vram_gb >= 14:
-        return MemoryPlan("fp8", "int8", 0, "fp8 DiT (약 5GB) + int8 텍스트 인코더")
+        return MemoryPlan("fp8", "int8" if bnb_ok else "none", 0, "fp8 DiT (약 5GB) + 텍스트 인코더")
+    if not bnb_ok:
+        swap = 0 if vram_gb >= 9 else 12
+        return MemoryPlan("fp8", "none", swap, f"FP8 DiT + 블록 스왑 {swap} (bitsandbytes 미사용 환경)")
     if vram_gb >= 9:
         return MemoryPlan("fp8", "nf4", 0, "fp8 DiT (약 5GB) + NF4 텍스트 인코더")
     return MemoryPlan("nf4", "nf4", 0, "NF4 DiT + NF4 텍스트 인코더 (저VRAM)")

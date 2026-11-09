@@ -148,7 +148,7 @@ class MossImageAdapter(ModelAdapter):
             self.tokenizer = Qwen2Tokenizer.from_pretrained(tok_path)
         if getattr(self.tokenizer, "chat_template", None) is None:
             raise RuntimeError(f"토크나이저에 채팅 템플릿이 없습니다: {tok_path}")
-        self.text_model = load_hf_model(AutoModel, te_path, self.dtype, self.device, quant)
+        self.text_model = load_hf_model(AutoModel, te_path, self.dtype, self.device, quant, drop_vision=True)
         if drop_vision_tower(self.text_model):
             free_memory()
 

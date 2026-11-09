@@ -89,7 +89,9 @@ def classify_keys(keys: List[str]) -> Optional[str]:
     joined = "\n".join(keys)
     if ".attn.wq." in joined or "txtfusion" in joined or "layerwise_blocks" in joined:
         return "krea2_dit"
-    if re.search(r"(^|\.)blocks\.\d+\..*qkv", joined) and ("text_refiner" in joined or "proj.qkv" in joined or "refiner" in joined):
+    if re.search(r"(^|\.)(blocks|layers)\.\d+\..*(qkv|proj\.ffn_down)", joined) and (
+        "text_refiner" in joined or "proj.qkv" in joined or "refiner" in joined or "final_linear_video" in joined
+    ):
         return "moss_dit"
     is_vae = any(k.startswith(("encoder.", "decoder.", "vae.")) or "quant_conv" in k for k in keys[:400])
     if is_vae:
@@ -98,7 +100,7 @@ def classify_keys(keys: List[str]) -> Optional[str]:
         if "time_conv" in joined or "downsamples" in joined or "residual" in joined:
             return "qwen_vae"
         return "vae"
-    if re.search(r"(^|\.)blocks\.\d+\..*qkv", joined):
+    if re.search(r"(^|\.)(blocks|layers)\.\d+\..*(qkv|proj\.ffn_down)", joined):
         return "moss_dit"
     return None
 

@@ -21,6 +21,7 @@ import statistics
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
+from .device import bnb_quant_available
 from .sysinfo import SystemSpec
 
 # ---------------------------------------------------------------------------
@@ -62,6 +63,8 @@ GPU_FACTORS = [
     (r"4070\s*SUPER", 0.55), (r"4070", 0.47), (r"4060\s*Ti", 0.34), (r"4060", 0.27),
     (r"3090\s*Ti", 0.66), (r"3090", 0.6), (r"3080\s*Ti", 0.58), (r"3080", 0.52), (r"3070\s*Ti", 0.42),
     (r"3070", 0.38), (r"3060\s*Ti", 0.33), (r"3060", 0.28), (r"2080\s*Ti", 0.22), (r"2080", 0.17),
+    (r"9070\s*XT", 0.58), (r"9070", 0.50), (r"9060\s*XT", 0.36), (r"9060", 0.30),
+    (r"7900\s*XTX", 0.55), (r"7900\s*XT", 0.46), (r"7800\s*XT", 0.35),
 ]
 
 
@@ -310,7 +313,7 @@ def base_steps(purpose: str, images: int) -> int:
 def _swap_needed(arch: str, quant: str, res, batch, ckpt, rank, opt, usable, sample_res, max_ram_gb) -> Optional[int]:
     """해당 정밀도에서 VRAM 에 맞추기 위한 최소 블록 스왑 수 (불가하면 None)."""
     m = MODEL_SPECS[arch]
-    limit = 0 if quant == "nf4" else int(m["blocks"] * 0.6)
+    limit = 0 if quant == "nf4" else max(0, int(m["blocks"]) - 2)
     per_block = m["weights_gb"][quant] / m["blocks"]
     for sw in range(0, limit + 1):
         s = TrainShape(arch, quant, sw, list(res), batch, 1, ckpt, rank, opt, sample_res=sample_res)
@@ -368,29 +371,38 @@ def recommend(arch: str, spec: SystemSpec, stats: DatasetStats, purpose: str = "
     lora_target = "all_linear" if arch == "krea2" else "attn_mlp"
     ema_decay = 0.0 if (arch == "moss_image" and purpose != "character") else 0.98
 
-    order = ["none", "fp8", "nf4"]
+    bnb_ok = bnb_quant_available()
+    default_opt = "adamw8bit" if bnb_ok else "adamw"
+    order = ["none", "fp8", "nf4"] if bnb_ok else ["none", "fp8"]
 
     def build(key, title, subtitle, candidates, opt, ckpt, steps_n, lr, sample_every, quant_pref, allow_swap, notes):
         """candidates: [(해상도 목록, rank), ...] 앞에서부터 VRAM 에 맞는 첫 조합 사용."""
         chosen = None
-        for res, rank in candidates:
-            for q in quant_pref:
-                sw = _swap_needed(arch, q, res, 1, ckpt, rank, opt, usable, 768, swap_ram if allow_swap else 0.0)
-                if sw is None or (sw > 0 and not allow_swap):
-                    continue
-                chosen = (q, sw, list(res), rank)
-                break
+        for swap_pass in ([False, True] if allow_swap or not bnb_ok else [False]):
+            q_list = [q for q in ("fp8", "nf4", "none") if q in quant_pref] if swap_pass else quant_pref
+            for res, rank in candidates:
+                for q in q_list:
+                    sw = _swap_needed(arch, q, res, 1, ckpt, rank, opt, usable, 768, swap_ram if swap_pass else 0.0)
+                    if sw is None or (sw > 0 and not swap_pass):
+                        continue
+                    chosen = (q, sw, list(res), rank)
+                    break
+                if chosen:
+                    break
             if chosen:
                 break
         fits = chosen is not None
         if not fits:
-            chosen = ("nf4", 0, [768], 16)
+            chosen = ("nf4" if bnb_ok else "fp8", 0 if bnb_ok else 12, [768], 16)
             notes = notes + ["VRAM 이 부족해 실행이 어려울 수 있습니다 (최소 설정으로 계산)."]
         q, sw, res, rank = chosen
         if fits and (res, rank) != (list(candidates[0][0]), candidates[0][1]):
             notes = notes + [f"VRAM 에 맞추기 위해 해상도 {'+'.join(map(str, res))} · rank {rank} 로 조정"]
-        te_q = "none" if vram >= MODEL_SPECS[arch]["te_gb"]["none"] + 1.5 else (
-            "int8" if vram >= MODEL_SPECS[arch]["te_gb"]["int8"] + 1.5 else "nf4")
+        if not bnb_ok:
+            te_q = "none"
+        else:
+            te_q = "none" if vram >= MODEL_SPECS[arch]["te_gb"]["none"] + 1.5 else (
+                "int8" if vram >= MODEL_SPECS[arch]["te_gb"]["int8"] + 1.5 else "nf4")
         shape = TrainShape(arch, q, sw, list(res), 1, 1, ckpt, rank, opt, steps_n, sample_every, 2, 20, 768,
                            True, te_q, images)
         sps = estimate_sec_per_step(shape, spec, calib)
@@ -412,23 +424,23 @@ def recommend(arch: str, spec: SystemSpec, stats: DatasetStats, purpose: str = "
     opts = []
     # 퀄리티: 가장 높은 정밀도 (블록 스왑 허용), 멀티 해상도, rank 상향, 스텝 +30%
     q_res = [768, max_res] if max_res > 768 else [768]
-    q_opt = "adamw" if usable >= 20 else "adamw8bit"
+    q_opt = "adamw" if (usable >= 20 or not bnb_ok) else "adamw8bit"
     q_cands = [(q_res, 32), (q_res, rank_main), ([max_res], rank_main), ([768], rank_main)]
     opts.append(build("quality", "퀄리티 중시", "정밀도·해상도 우선", q_cands, q_opt, True,
                       int(round(steps * 1.3 / 50) * 50), lr_main, max(250, steps // 8 // 50 * 50),
                       order, True, ["멀티 해상도로 다양한 크기에 강함"] if len(q_res) > 1 else []))
     # 최적: 스왑 없이 들어가는 가장 높은 정밀도, 기본 해상도
     opts.append(build("balanced", "최적", "품질·속도 균형 (권장)", [([max_res], rank_main), ([max_res], 16), ([768], rank_main), ([768], 16)],
-                      "adamw8bit", True,
+                      default_opt, True,
                       steps, lr_main, 250, order, False, []))
     # 속도: 스왑 없이 가장 빠른 조합, 768, 스텝 -25%, 샘플 간격 넓게
-    fast = [q for q in ("fp8", "none", "nf4")]
-    sp = build("speed", "속도 중시", "빠른 결과 확인용", [([768], 16), ([512], 16)], "adamw8bit", True,
+    fast = [q for q in (("fp8", "none", "nf4") if bnb_ok else ("fp8", "none"))]
+    sp = build("speed", "속도 중시", "빠른 결과 확인용", [([768], 16), ([512], 16)], default_opt, True,
                int(round(steps * 0.75 / 50) * 50), lr_main * 1.25, 500, fast, False,
                ["768 해상도 · 스텝 25% 감소 (학습률 소폭 상향)"])
     # 여유가 있으면 체크포인팅 끄기 (더 빠름)
     shape_off = TrainShape(arch, sp.settings["transformer_quant"], 0, list(sp.settings["resolutions"]), 1, 1,
-                           False, 16, "adamw8bit")
+                           False, 16, default_opt)
     if sp.fits and sp.settings["block_swap"] == 0 and estimate_vram(shape_off) <= usable:
         sp.settings["gradient_checkpointing"] = False
         shape_off.max_steps = sp.settings["max_steps"]

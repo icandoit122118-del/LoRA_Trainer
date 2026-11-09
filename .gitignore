@@ -6,6 +6,9 @@ _release/release_git_token.txt
 
 # ── 대용량 / 로컬 산출물 (앞의 / = 프로젝트 루트 폴더만. lora_trainer/models 같은 소스 폴더는 제외되지 않음) ──
 /models/
+/loras/*.safetensors
+/loras/*.ckpt
+/loras/*.pt
 /output/
 /configs/
 /_backup/

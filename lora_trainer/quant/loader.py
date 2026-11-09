@@ -41,13 +41,52 @@ class LazyCheckpoint:
 
     def get(self, key: str) -> torch.Tensor:
         t = self._handles[self._where[key]].get_tensor(key)
-        # ComfyUI "scaled fp8" 파일: <name>.weight(fp8) * <name>.scale_weight
-        if t.dtype in _fp8_dtypes() and key.endswith(".weight"):
-            scale_key = key[: -len("weight")] + "scale_weight"
-            t = t.to(torch.float32)
-            if scale_key in self._where:
-                s = self._handles[self._where[scale_key]].get_tensor(scale_key).to(torch.float32)
-                t = t * s if s.numel() == 1 else t * s.reshape(-1, *([1] * (t.dim() - 1)))
+        # ComfyUI "scaled fp8" 또는 "int8_tensorwise (convrot 포함)" 파일 역양자화
+        if key.endswith(".weight"):
+            prefix = key[: -len("weight")]
+            scale_key = (
+                prefix + "scale_weight"
+                if (prefix + "scale_weight") in self._where
+                else (prefix + "weight_scale" if (prefix + "weight_scale") in self._where else None)
+            )
+            if t.dtype in _fp8_dtypes():
+                t = t.to(torch.float32)
+                if scale_key is not None:
+                    s = self._handles[self._where[scale_key]].get_tensor(scale_key).to(torch.float32)
+                    t = t * s if s.numel() == 1 else t * s.reshape(-1, *([1] * (t.dim() - 1)))
+            elif t.dtype == torch.int8 and scale_key is not None:
+                s = self._handles[self._where[scale_key]].get_tensor(scale_key)
+                cq_key = prefix + "comfy_quant"
+                convrot, group_size = False, 256
+                if cq_key in self._where:
+                    try:
+                        import json
+
+                        raw = bytes(self._handles[self._where[cq_key]].get_tensor(cq_key).tolist())
+                        cq = json.loads(raw.decode("utf-8", errors="ignore"))
+                        convrot = bool(cq.get("convrot", False))
+                        group_size = int(cq.get("convrot_groupsize", 256))
+                    except Exception:
+                        pass
+                if convrot:
+                    try:
+                        from comfy_kitchen.tensor import TensorWiseINT8Layout
+                    except ImportError as e:
+                        raise RuntimeError(
+                            "ComfyUI int8 convrot 체크포인트를 역양자화하려면 comfy_kitchen 패키지가 필요합니다."
+                        ) from e
+                    params = TensorWiseINT8Layout.Params(
+                        scale=s,
+                        orig_dtype=torch.bfloat16,
+                        orig_shape=tuple(t.shape),
+                        is_weight=True,
+                        convrot=True,
+                        convrot_groupsize=group_size,
+                    )
+                    return TensorWiseINT8Layout.dequantize(t, params).to(torch.float32)
+                s_f = s.to(torch.float32)
+                t = t.to(torch.float32)
+                t = t * s_f if s_f.numel() == 1 else t * s_f.reshape(-1, *([1] * (t.dim() - 1)))
         return t
 
     def close(self) -> None:

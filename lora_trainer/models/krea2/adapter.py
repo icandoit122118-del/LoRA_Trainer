@@ -126,7 +126,7 @@ class Krea2Adapter(ModelAdapter):
         tok_path = resolve_path(tok_path, self.models_dir, self.hf_token, log=self.log)
         self.log(f"Qwen3-VL 텍스트 인코더 로딩 ({quant}) : {path}")
         self.tokenizer = AutoTokenizer.from_pretrained(tok_path)
-        self.text_model = load_hf_model(TECls, path, self.dtype, self.device, quant)
+        self.text_model = load_hf_model(TECls, path, self.dtype, self.device, quant, drop_vision=True)
         if drop_vision_tower(self.text_model):
             free_memory()
         n_prefix = len(self.tokenizer(PROMPT_PREFIX)["input_ids"])

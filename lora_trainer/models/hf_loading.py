@@ -7,8 +7,13 @@ from typing import Optional
 import torch
 
 
+from ..core.device import bnb_quant_available
+
+
 def quantization_config(quant: str, compute_dtype: torch.dtype):
     if quant in (None, "", "none", "auto"):
+        return None
+    if not bnb_quant_available():
         return None
     try:
         from transformers import BitsAndBytesConfig
@@ -27,7 +32,8 @@ def quantization_config(quant: str, compute_dtype: torch.dtype):
 
 
 def load_hf_model(cls, path: str, dtype: torch.dtype, device: torch.device, quant: str,
-                  subfolder: Optional[str] = None, token: Optional[str] = None, **kwargs):
+                  subfolder: Optional[str] = None, token: Optional[str] = None,
+                  drop_vision: bool = False, **kwargs):
     qcfg = quantization_config(quant, dtype)
     load_kwargs = dict(token=token, **kwargs)
     if subfolder:
@@ -42,8 +48,23 @@ def load_hf_model(cls, path: str, dtype: torch.dtype, device: torch.device, quan
         model = cls.from_pretrained(path, dtype=dtype, **load_kwargs)
     except TypeError:
         model = cls.from_pretrained(path, torch_dtype=dtype, **load_kwargs)
+    if drop_vision:
+        drop_vision_tower(model)
     if qcfg is None:
-        model = model.to(device)
+        if device.type == "cuda":
+            param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(device)
+            except Exception:
+                free_bytes = torch.cuda.get_device_properties(device).total_memory
+            if param_bytes <= int(free_bytes * 0.85):
+                try:
+                    model = model.to(device)
+                except RuntimeError:
+                    torch.cuda.empty_cache()
+                    model = model.to("cpu")
+        else:
+            model = model.to(device)
     model.eval().requires_grad_(False)
     return model
 

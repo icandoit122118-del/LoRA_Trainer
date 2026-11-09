@@ -39,6 +39,10 @@ def inspect(path: str) -> None:
         fmt = "kohya (lora_unet_*)"
     elif any(k.startswith("diffusion_model.") and ".lora_A." in k for k in keys):
         fmt = "ComfyUI (diffusion_model.*.lora_A/B)"
+    elif any(k.startswith("diffusion_model.") and ".lora_down." in k for k in keys):
+        fmt = "ComfyUI/kohya (diffusion_model.*.lora_down/up)"
+    elif any(".lora_A" in k for k in keys):
+        fmt = "PEFT/Diffusers (*.lora_A/B)"
     say(f"형식: {fmt}")
 
     # 메타데이터 ---------------------------------------------------------------
@@ -48,8 +52,23 @@ def inspect(path: str) -> None:
             cfg = json.loads(meta["lora_trainer_config"])
         except json.JSONDecodeError:
             pass
-    say(f"베이스 모델: {meta.get('ss_base_model_version', '?')} · 학습 스텝: {meta.get('ss_training_steps', '?')} · "
-        f"트레이너 v{meta.get('lora_trainer_version', '?')} · 트리거: {meta.get('lora_trainer_trigger', '') or '(없음)'}")
+    base_ver = (
+        meta.get("ss_base_model_version")
+        or meta.get("ss_base_model")
+        or meta.get("modelspec.architecture")
+        or meta.get("ss_architecture")
+        or "?"
+    )
+    steps_ver = (
+        meta.get("ss_training_steps")
+        or meta.get("ss_steps")
+        or (f"{meta['ss_epoch']} epoch" if meta.get("ss_epoch") else "?")
+    )
+    trig = meta.get("lora_trainer_trigger") or meta.get("oslora_trigger") or "(없음)"
+    res_meta = meta.get("oslora_resolution") or meta.get("modelspec.resolution") or ""
+    say(f"베이스 모델: {base_ver} · 학습 스텝: {steps_ver}"
+        + (f" · 해상도: {res_meta}" if res_meta else "")
+        + f" · 트레이너 v{meta.get('lora_trainer_version', '?')} · 트리거: {trig}")
     if cfg:
         m, t, n = cfg.get("model", {}), cfg.get("train", {}), cfg.get("network", {})
         say(f"설정: arch={m.get('arch')} quant={m.get('transformer_quant')} swap={m.get('block_swap')} dtype={m.get('dtype')} | "
@@ -64,8 +83,9 @@ def inspect(path: str) -> None:
     # 모듈별 가중치 --------------------------------------------------------------
     mods = defaultdict(dict)
     for k, v in tensors.items():
-        for suf, kind in ((".lora_up.weight", "up"), (".lora_B.weight", "up"),
-                          (".lora_down.weight", "down"), (".lora_A.weight", "down"), (".alpha", "alpha")):
+        for suf, kind in ((".lora_up.weight", "up"), (".lora_B.weight", "up"), (".lora_B", "up"),
+                          (".lora_down.weight", "down"), (".lora_A.weight", "down"), (".lora_A", "down"),
+                          (".alpha", "alpha")):
             if k.endswith(suf):
                 mods[k[: -len(suf)]][kind] = v
     say(f"LoRA 모듈: {len(mods)}개")
@@ -87,8 +107,15 @@ def inspect(path: str) -> None:
         ups.append(a)
         if up.abs().max().item() == 0:
             zero += 1
-        # 실제 가중치 변화량 ||ΔW|| (rank 이 작아 저렴하게 계산)
-        delta = (torch.linalg.matrix_norm(up @ down) * alpha / rank).item() if up.dim() == 2 else 0.0
+        # 실제 가중치 변화량 ||ΔW||_F: tr((B^T B)(A A^T))^0.5 로 거대 행렬 생성 없이 초고속 계산
+        if up.dim() == 2 and down.dim() == 2:
+            up_d, down_d = up.double(), down.double()
+            btb = up_d.t() @ up_d
+            aat = down_d @ down_d.t()
+            frob = (btb * aat).sum().clamp_min(0.0).sqrt().item()
+            delta = frob * alpha / max(1, rank)
+        else:
+            delta = 0.0
         deltas.append(delta)
         m = re.search(r"(layers|blocks)[._](\d+)", name)
         per_block[int(m.group(2)) if m else -1].append(delta)
@@ -132,11 +159,13 @@ def main(argv) -> int:
     if not paths:
         found = glob.glob(os.path.join(ROOT, "output", "**", "*.safetensors"), recursive=True)
         found = [p for p in found if os.sep + "cache" + os.sep not in p and os.sep + "state" + os.sep not in p]
-        paths = sorted(found, key=os.path.getmtime, reverse=True)[:5]
+        if not found:
+            found = glob.glob(os.path.join(ROOT, "loras", "**", "*.safetensors"), recursive=True)
+        paths = sorted(found, key=os.path.getmtime, reverse=True)[:7]
         if not paths:
             say("검사할 LoRA 가 없습니다. .safetensors 파일을 LoRA점검.bat 위로 끌어다 놓으세요.")
             return 1
-        say(f"output 폴더의 최근 LoRA {len(paths)}개를 검사합니다.")
+        say(f"최근 LoRA {len(paths)}개를 검사합니다.")
     for p in paths:
         try:
             inspect(p)

@@ -11,6 +11,35 @@ USER_DIR = os.path.join(ROOT, "user_data")
 SETTINGS_PATH = os.path.join(USER_DIR, "settings.json")
 QUEUE_DIR = os.path.join(USER_DIR, "queue")
 SPEED_CALIB_PATH = os.path.join(USER_DIR, "speed_calibration.json")
+_DEFAULT_COMFY_MODELS = r"D:\AI\ComfyUI_windows_portable\ComfyUI\models"
+
+
+def _default_comfy_lora_dir() -> str:
+    cand = os.path.join(_DEFAULT_COMFY_MODELS, "loras")
+    return cand if os.path.isdir(cand) else ""
+
+
+def _default_model_paths() -> dict:
+    paths: dict = {}
+    if not os.path.isdir(_DEFAULT_COMFY_MODELS):
+        return paths
+    krea_dit = os.path.join(_DEFAULT_COMFY_MODELS, "diffusion_models", "krea2_turbo_int8_convrot.safetensors")
+    krea_vae = os.path.join(_DEFAULT_COMFY_MODELS, "vae", "qwen_image_vae.safetensors")
+    moss_dit = os.path.join(_DEFAULT_COMFY_MODELS, "diffusion_models", "moss_image_sft_int8_convrot.safetensors")
+    moss_vae = os.path.join(_DEFAULT_COMFY_MODELS, "vae", "flux2-vae.safetensors")
+    paths["krea2"] = {
+        "transformer": krea_dit if os.path.isfile(krea_dit) else "",
+        "text_encoder": "",
+        "tokenizer": "",
+        "vae": krea_vae if os.path.isfile(krea_vae) else "",
+    }
+    paths["moss_image"] = {
+        "transformer": moss_dit if os.path.isfile(moss_dit) else "",
+        "text_encoder": "",
+        "tokenizer": "",
+        "vae": moss_vae if os.path.isfile(moss_vae) else "",
+    }
+    return paths
 
 
 @dataclass
@@ -18,11 +47,11 @@ class AppSettings:
     hf_token: str = ""
     models_dir: str = os.path.join(ROOT, "models")
     output_dir: str = os.path.join(ROOT, "output")
-    comfy_lora_dir: str = ""
+    comfy_lora_dir: str = field(default_factory=_default_comfy_lora_dir)
     last_config: str = ""
     recent: list = field(default_factory=list)
     # 모델별로 기억하는 구성 파일 경로 {arch: {transformer, text_encoder, tokenizer, vae}}
-    model_paths: dict = field(default_factory=dict)
+    model_paths: dict = field(default_factory=_default_model_paths)
     # 추천 설정의 학습 목적 (character | style | general)
     purpose: str = "character"
     # MOSS-Image 캡션용 Ollama (Gemma 4) 로컬 연결

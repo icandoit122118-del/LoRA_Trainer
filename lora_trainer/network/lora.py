@@ -172,6 +172,8 @@ class LoRANetwork(nn.Module):
         loaded = 0
         for l in self.loras:
             entry = by_name.get(l.lora_name) or by_name.get(l.lora_name.replace(".", "_"))
+            if (not entry or "down" not in entry or "up" not in entry) and l.lora_name.endswith(".proj.qkv"):
+                entry = _merge_qkv_lora_entries(by_name, l.lora_name, l.rank, l.alpha_value, l.scale)
             if not entry or "down" not in entry or "up" not in entry:
                 continue
             down, up = entry["down"], entry["up"]
@@ -188,15 +190,62 @@ class LoRANetwork(nn.Module):
         return loaded, len(self.loras)
 
 
+def _merge_qkv_lora_entries(
+    by_name: dict, qkv_name: str, target_rank: int, target_alpha: float, target_scale: Optional[float] = None
+) -> Optional[dict]:
+    """분리된 proj.q / proj.k / proj.v LoRA 가중치를 결합된 proj.qkv LoRA(target_rank)로 고속 QR-SVD 병합."""
+    prefix_dot = qkv_name[: -len("qkv")]
+    prefix_us = prefix_dot.replace(".", "_")
+    ups = []
+    downs = []
+    in_dim = None
+    for part in ("q", "k", "v"):
+        e = by_name.get(prefix_dot + part) or by_name.get(prefix_us + part)
+        if not e or "down" not in e or "up" not in e:
+            return None
+        down, up = e["down"].float(), e["up"].float()
+        if down.dim() != 2 or up.dim() != 2 or up.shape[1] != down.shape[0]:
+            return None
+        if in_dim is None:
+            in_dim = down.shape[1]
+        elif down.shape[1] != in_dim:
+            return None
+        r_part = down.shape[0]
+        alpha = float(e["alpha"]) if "alpha" in e else float(r_part)
+        ups.append(up)
+        downs.append(down * (alpha / max(1, r_part)))
+    # full_delta = B @ A, B = block_diag(u_q, u_k, u_v) (3D, 3r), A = cat(d_q, d_k, d_v) (3r, D)
+    b_mat = torch.block_diag(*ups)
+    a_mat = torch.cat(downs, dim=0)
+    q_b, r_b = torch.linalg.qr(b_mat, mode="reduced")
+    q_a, r_a = torch.linalg.qr(a_mat.t(), mode="reduced")
+    u_m, s, vh_m = torch.linalg.svd(r_b @ r_a.t(), full_matrices=False)
+    r = min(target_rank, s.shape[0])
+    u_top = q_b @ u_m[:, :r]
+    vh_top = vh_m[:r, :] @ q_a.t()
+    sqrt_s = s[:r].clamp_min(0.0).sqrt()
+    scale = target_scale if (target_scale is not None and target_scale > 0) else (target_alpha / max(1, target_rank))
+    inv_scale = 1.0 / scale if scale != 0 else 1.0
+    up_merged = torch.zeros(b_mat.shape[0], target_rank, dtype=torch.float32)
+    down_merged = torch.zeros(target_rank, a_mat.shape[1], dtype=torch.float32)
+    up_merged[:, :r] = u_top * (sqrt_s * math.sqrt(inv_scale))[None, :]
+    down_merged[:r, :] = (sqrt_s * math.sqrt(inv_scale))[:, None] * vh_top
+    return {"down": down_merged, "up": up_merged, "alpha": torch.tensor(target_alpha)}
+
+
 def _parse_lora_key(key: str):
     """키 -> (모듈이름, down|up|alpha). kohya 는 밑줄 이름을 반환."""
-    for prefix in (COMFY_PREFIX, "transformer.", "base_model.model.", "model.diffusion_model."):
-        if key.startswith(prefix):
-            body = key[len(prefix):]
-            for suffix, kind in ((".lora_A.weight", "down"), (".lora_B.weight", "up"),
-                                 (".lora_down.weight", "down"), (".lora_up.weight", "up"), (".alpha", "alpha")):
-                if body.endswith(suffix):
-                    return body[: -len(suffix)], kind
+    for prefix in (COMFY_PREFIX, "transformer.", "base_model.model.", "model.diffusion_model.", ""):
+        if prefix and not key.startswith(prefix):
+            continue
+        if not prefix and key.startswith(KOHYA_PREFIX):
+            continue
+        body = key[len(prefix):]
+        for suffix, kind in ((".lora_A.weight", "down"), (".lora_B.weight", "up"),
+                             (".lora_A", "down"), (".lora_B", "up"),
+                             (".lora_down.weight", "down"), (".lora_up.weight", "up"), (".alpha", "alpha")):
+            if body.endswith(suffix):
+                return body[: -len(suffix)], kind
     if key.startswith(KOHYA_PREFIX):
         body = key[len(KOHYA_PREFIX):]
         for suffix, kind in ((".lora_down.weight", "down"), (".lora_up.weight", "up"), (".alpha", "alpha")):
